@@ -1,0 +1,14 @@
+{
+  "name": "a-evolve",
+  "description": "Claude Code mods maintained alongside A-Evolve.",
+  "owner": {
+    "name": "Patrick Karle"
+  },
+  "plugins": [
+    {
+      "name": "audit-ledger",
+      "source": "./mods/audit-ledger",
+      "description": "Hash-chained audit ledger of tool calls, turns, subagent spawns and mod capability calls, with a forked completion-integrity supervisor."
+    }
+  ]
+}

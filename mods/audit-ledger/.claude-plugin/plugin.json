@@ -1,0 +1,36 @@
+{
+  "name": "audit-ledger",
+  "version": "0.1.0",
+  "description": "Hash-chained audit ledger of tool calls, turns, subagent spawns and mod capability calls, with a forked completion-integrity supervisor.",
+  "author": { "name": "Patrick Karle" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "ledgerDir": {
+      "type": "string",
+      "title": "Ledger directory",
+      "description": "Where segments are written: relative to the project root, or absolute.",
+      "default": ".claude/audit"
+    },
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "observe records after each tool call; enforce records intent first and refuses any tool call it cannot record.",
+      "options": ["observe", "enforce"],
+      "default": "observe"
+    },
+    "supervise": {
+      "type": "string",
+      "title": "Completion supervisor",
+      "description": "claims forks a supervisor only when an answer claims completion; always forks after every answer; off disables it.",
+      "options": ["claims", "always", "off"],
+      "default": "claims"
+    },
+    "capture": {
+      "type": "string",
+      "title": "Payload capture",
+      "description": "excerpt keeps a redacted 500-character excerpt beside each SHA-256 digest; digest keeps the digest and size alone.",
+      "options": ["excerpt", "digest"],
+      "default": "excerpt"
+    }
+  }
+}
