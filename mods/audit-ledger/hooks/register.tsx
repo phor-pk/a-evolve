@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, OpEventResult, Register } from 'claude-code'
 
 import type { AuditHealth, AuditMeter, AuditReview } from '../types'
 import {
@@ -20,7 +20,7 @@ import {
   tailOf,
   verifyChain,
 } from './ledger'
-import type { CallNote, Capture, ChainReport, Head, SupervisorSnapshot } from './ledger'
+import type { CallNote, Capture, Head, SupervisorSnapshot } from './ledger'
 
 const review = atom({ plugin: 'audit-ledger', key: 'review' } as const, null)
 const isDismissed = atom({ plugin: 'audit-ledger', key: 'isDismissed' } as const, false)
@@ -81,6 +81,24 @@ let config: Config = { mode: 'observe', supervise: 'claims', capture: 'excerpt',
 let cursor: Cursor | null = null
 let queue: Promise<unknown> = Promise.resolve()
 let turn: Turn | null = null
+let digestKey: Uint8Array | null = null
+// The turn that spawned each subagent: its calls are evidence for that turn only.
+let agentTurn = new Map<string, string>()
+
+// The per-machine key behind every payload digest, kept in the mod's store
+// and never in the ledger.
+async function keyOf($: EngineInterface): Promise<Uint8Array> {
+  if (digestKey !== null) return digestKey
+  const stored = await $.store.get('digest-key')
+  if (typeof stored === 'string' && stored.length > 0) {
+    digestKey = Uint8Array.from(atob(stored), char => char.charCodeAt(0))
+    return digestKey
+  }
+  const fresh = crypto.getRandomValues(new Uint8Array(32))
+  await $.store.set('digest-key', btoa(String.fromCharCode(...fresh)))
+  digestKey = fresh
+  return fresh
+}
 
 // Every ledger read and write runs here, one at a time, in the order asked.
 function exclusive<T>(task: () => Promise<T>): Promise<T> {
@@ -142,7 +160,9 @@ async function open($: EngineInterface, session: string): Promise<{ at: Cursor; 
   return { at, notice: reasons.length === 0 ? null : { reasons, head, disk: { seq, hash, segment: highest } } }
 }
 
-async function put($: EngineInterface, at: Cursor, kind: string, data: unknown, origin?: string): Promise<Cursor> {
+type Put = { at: Cursor; anchorError: string | null }
+
+async function put($: EngineInterface, at: Cursor, kind: string, data: unknown, origin?: string): Promise<Put> {
   const entry = await seal({
     v: SCHEMA,
     seq: at.seq + 1,
@@ -166,26 +186,35 @@ async function put($: EngineInterface, at: Cursor, kind: string, data: unknown, 
   }
   const next = { ...at, seq: entry.seq, hash: entry.hash, segment, text }
   cursor = next
-  // The entry is durable on disk; a head that fails to anchor is reconciled
-  // (and sealed as head-behind) by the next open.
+  // The entry is durable on disk either way. A head that fails to anchor is
+  // retried by the next put and reconciled by the next open, but the caller
+  // still hears of it: enforce mode treats it as a failed record.
   try {
     await $.store.set(headKey(at.session), { seq: entry.seq, hash: entry.hash, segment })
+    return { at: next, anchorError: null }
   } catch (error) {
-    $.ui.status(`audit-ledger: head anchor failing: ${clip(errorText(error), 80)}`)
+    return { at: next, anchorError: errorText(error) }
   }
-  return next
 }
 
 async function write($: EngineInterface, kind: string, data: unknown, origin?: string): Promise<number> {
   const session = await $.session.id()
   let at = cursor
+  let anchorError: string | null = null
   if (at === null || at.session !== session) {
     const opened = await open($, session)
     at = opened.at
     cursor = at
-    if (opened.notice !== null) at = await put($, at, 'ledger.reanchor', opened.notice)
+    if (opened.notice !== null) {
+      const sealed = await put($, at, 'ledger.reanchor', opened.notice)
+      at = sealed.at
+      anchorError = sealed.anchorError
+    }
   }
-  return (await put($, at, kind, data, origin)).seq
+  const written = await put($, at, kind, data, origin)
+  anchorError = written.anchorError ?? anchorError
+  if (anchorError !== null) throw new Error(`entry ${written.at.seq} is on disk but its head did not anchor: ${anchorError}`)
+  return written.at.seq
 }
 
 async function append($: EngineInterface, kind: string, data: unknown, origin?: string): Promise<number> {
@@ -250,13 +279,14 @@ async function superviseTurn($: EngineInterface, snap: SupervisorSnapshot): Prom
     await record($, 'supervisor.invalid', {
       turnId: snap.turnId,
       reason: parsed.error,
-      reply: await payload(result.text, config.capture),
+      reply: await payload(result.text, config.capture, await keyOf($)),
       usage,
     })
     if (isCurrent) $.ui.toast(`audit-ledger: supervisor reply rejected: ${parsed.error}`)
     return
   }
-  const { verdict, isOverridden } = applyFloor(parsed.verdict, snap.claimWithoutCheck)
+  const hasPassingCheck = snap.calls.some(call => call.isCheck && call.outcome === 'ok')
+  const { verdict, isOverridden } = applyFloor(parsed.verdict, !hasPassingCheck)
   await settle({ ...base, status: 'done', verdict, isOverridden })
   await record($, 'supervisor.verdict', {
     turnId: snap.turnId,
@@ -297,20 +327,40 @@ async function readSegments($: EngineInterface, dir: string): Promise<string[]> 
   return lines
 }
 
-// A consistent snapshot: no append can land between reading the head and
-// reading the segments.
+// A consistent snapshot without holding the write queue across a hookable
+// call: the head is taken once the queue drains (from memory when this load
+// wrote it), and entries appended after it are cut from what is read.
 async function snapshot($: EngineInterface): Promise<{ dir: string; head: Head | null; lines: string[] }> {
   const session = await $.session.id()
+  const held = await exclusive(async () => cursor)
+  let head: Head | null
+  if (held !== null && held.session === session) head = { seq: held.seq, hash: held.hash, segment: held.segment }
+  else {
+    const stored = await $.store.get(headKey(session))
+    head = isHead(stored) ? stored : null
+  }
   const dir = await dirOf($, session)
-  const stored = await $.store.get(headKey(session))
-  return { dir, head: isHead(stored) ? stored : null, lines: await readSegments($, dir) }
+  const lines = await readSegments($, dir)
+  if (head === null) return { dir, head, lines }
+  const limit = head.seq
+  return {
+    dir,
+    head,
+    lines: lines.filter(line => {
+      try {
+        const seq = (JSON.parse(line) as { seq?: unknown }).seq
+        return typeof seq !== 'number' || seq <= limit
+      } catch {
+        return true
+      }
+    }),
+  }
 }
 
 async function verify($: EngineInterface): Promise<string> {
-  const { dir, report } = await exclusive(async (): Promise<{ dir: string; report: ChainReport }> => {
-    const snap = await snapshot($)
-    return { dir: snap.dir, report: await verifyChain(snap.lines, snap.head) }
-  })
+  const snap = await snapshot($)
+  const dir = snap.dir
+  const report = await verifyChain(snap.lines, snap.head)
   await record($, 'ledger.verify', {
     isIntact: report.isIntact,
     entries: report.entries,
@@ -323,7 +373,7 @@ async function verify($: EngineInterface): Promise<string> {
 }
 
 async function tail($: EngineInterface, count: number): Promise<string> {
-  const { lines } = await exclusive(() => snapshot($))
+  const { lines } = await snapshot($)
   const kept = lines.filter(line => line.trim() !== '').slice(-count)
   if (kept.length === 0) return 'The ledger is empty.'
   return kept
@@ -348,6 +398,7 @@ export const register: Register = (on, options) => {
   cursor = null
   queue = Promise.resolve()
   turn = null
+  agentTurn = new Map()
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -381,7 +432,7 @@ export const register: Register = (on, options) => {
     if (result.drop !== undefined) {
       await record($, 'prompt.drop', { origin: e.origin?.kind, reason: result.drop })
     } else {
-      await record($, 'prompt.submit', { origin: e.origin?.kind, text: await payload(result.text, config.capture) })
+      await record($, 'prompt.submit', { origin: e.origin?.kind, text: await payload(result.text, config.capture, await keyOf($)) })
     }
     return result
   })
@@ -400,7 +451,7 @@ export const register: Register = (on, options) => {
     const by = next.origin.plugin === 'engine' ? undefined : next.origin.plugin
     const started = await $.clock.now()
     if (config.mode === 'enforce') {
-      await append($, 'tool.intent', { tool, id: e.tool_use_id, agentId: e.agentId, input: await payload(input, config.capture) }, by)
+      await append($, 'tool.intent', { tool, id: e.tool_use_id, agentId: e.agentId, input: await payload(input, config.capture, await keyOf($)) }, by)
     }
     const result = await next(e)
     const outcome = result.deny !== undefined ? 'denied' : result.isError === true ? 'error' : 'ok'
@@ -413,20 +464,23 @@ export const register: Register = (on, options) => {
         tool,
         id: e.tool_use_id,
         agentId: e.agentId,
-        input: await payload(input, config.capture),
+        input: await payload(input, config.capture, await keyOf($)),
         outcome,
         deny: result.deny,
         isCheck,
         ms: (await $.clock.now()) - started,
-        output: typeof result.text === 'string' ? await payload(result.text, outcome === 'ok' ? 'digest' : config.capture) : undefined,
+        output: typeof result.text === 'string' ? await payload(result.text, outcome === 'ok' ? 'digest' : config.capture, await keyOf($)) : undefined,
       },
       by,
     )
     if (turn !== null && by === undefined) {
       const summary = clip(command !== '' ? command : canonical(input))
       if (e.agentId === undefined) turn.calls.push({ tool, outcome, isCheck, summary })
-      else if (isCheck) turn.calls.push({ tool, outcome, isCheck, summary: `[subagent ${e.agentId}] ${summary}` })
-      else turn.subagentCalls += 1
+      else if (agentTurn.get(e.agentId) === turn.id) {
+        // Only a subagent this turn spawned speaks for this turn.
+        if (isCheck) turn.calls.push({ tool, outcome, isCheck, summary: `[subagent ${e.agentId}] ${summary}` })
+        else turn.subagentCalls += 1
+      }
     }
     return result
   }).catch(($, e, next) => {
@@ -439,14 +493,15 @@ export const register: Register = (on, options) => {
 
   on('agent.spawn', async ($, e, next) => {
     const result = await next(e)
+    if (result.agentId !== undefined && turn !== null) agentTurn.set(result.agentId, turn.id)
     await record(
       $,
       'agent.spawn',
       {
         id: e.tool_use_id,
         subagentType: e.subagentType,
-        description: await payload(e.description, config.capture),
-        prompt: await payload(e.prompt, config.capture),
+        description: await payload(e.description, config.capture, await keyOf($)),
+        prompt: await payload(e.prompt, config.capture, await keyOf($)),
         requestedModel: e.model,
         model: result.model,
         agentId: result.agentId,
@@ -468,7 +523,7 @@ export const register: Register = (on, options) => {
       reason: e.reason,
       durationMs: e.durationMs,
       usage: e.usage,
-      answer: await payload(e.answer, config.capture),
+      answer: await payload(e.answer, config.capture, await keyOf($)),
     }).catch(() => null)
     const ended = turn
     if (e.agentId === undefined) turn = null
@@ -503,38 +558,47 @@ export const register: Register = (on, options) => {
   on('fs.write', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record($, 'op.fs.write', { path: e.path, text: await payload(e.text, 'digest'), deny: result.deny }, next.origin.plugin)
+    void record($, 'op.fs.write', { path: e.path, text: await payload(e.text, 'digest', await keyOf($)), deny: result.deny }, next.origin.plugin)
     return result
   })
 
   on('process.run', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record(
+    void record(
       $,
       'op.process.run',
-      { argv: await payload(e.argv.join(' '), config.capture), cwd: e.init?.cwd, exitCode: result.value?.exitCode, deny: result.deny },
+      { argv: await payload(e.argv.join(' '), config.capture, await keyOf($)), cwd: e.init?.cwd, exitCode: result.value?.exitCode, deny: result.deny },
       next.origin.plugin,
     )
     return result
   })
 
+  // A spawn is recorded when it starts, and again when its stream ends, is
+  // closed early by its reader, or throws: a child left running or abandoned
+  // still leaves a record.
   on('process.spawn', async function* ($, e, next) {
     if (next.origin.plugin === $.plugin.name) return yield* next(e)
-    const result = yield* next(e)
-    await record(
-      $,
-      'op.process.spawn',
-      {
-        argv: await payload(e.argv.join(' '), config.capture),
-        cwd: e.cwd,
-        code: result?.value?.code,
-        signal: result?.value?.signal,
-        deny: result?.deny,
-      },
-      next.origin.plugin,
-    )
-    return result
+    const by = next.origin.plugin
+    const argv = await payload(e.argv.join(' '), config.capture, await keyOf($))
+    void record($, 'op.process.spawn', { phase: 'start', argv, cwd: e.cwd }, by)
+    let result: OpEventResult<'process.spawn'> | undefined
+    let ending = 'closed-early'
+    try {
+      result = (yield* next(e)) as OpEventResult<'process.spawn'>
+      ending = 'ended'
+      return result
+    } catch (error) {
+      ending = 'threw'
+      throw error
+    } finally {
+      void record(
+        $,
+        'op.process.spawn',
+        { phase: 'end', argv: argv.digest, ending, code: result?.value?.code, signal: result?.value?.signal, deny: result?.deny },
+        by,
+      )
+    }
   })
 
   // A URL path can carry the credential itself (webhook and bot tokens), so
@@ -543,13 +607,13 @@ export const register: Register = (on, options) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
     const url = URL.canParse(e.url) ? new URL(e.url) : null
-    await record(
+    void record(
       $,
       'op.http.fetch',
       {
         method: e.init?.method ?? 'GET',
         origin: url === null ? '(unparseable)' : url.origin,
-        path: await payload(url === null ? e.url : `${url.pathname}${url.search}`, 'digest'),
+        path: await payload(url === null ? e.url : `${url.pathname}${url.search}`, 'digest', await keyOf($)),
         status: result.value?.status,
         deny: result.deny,
       },
@@ -561,7 +625,7 @@ export const register: Register = (on, options) => {
   on('env.set', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record($, 'op.env.set', { name: e.name, isUnset: e.value === undefined, deny: result.deny }, next.origin.plugin)
+    void record($, 'op.env.set', { name: e.name, isUnset: e.value === undefined, deny: result.deny }, next.origin.plugin)
     return result
   })
 
@@ -569,12 +633,12 @@ export const register: Register = (on, options) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
     const value = result.value
-    await record(
+    void record(
       $,
       'op.model.complete',
       {
         model: e.model,
-        prompt: await payload(e.prompt, 'digest'),
+        prompt: await payload(e.prompt, 'digest', await keyOf($)),
         isAnswered: value?.isAnswered,
         usage: value === undefined ? undefined : value.usage,
         deny: result.deny,
@@ -588,11 +652,11 @@ export const register: Register = (on, options) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
     const value = result.value
-    await record(
+    void record(
       $,
       'op.model.fork',
       {
-        prompt: await payload(e.prompt, 'digest'),
+        prompt: await payload(e.prompt, 'digest', await keyOf($)),
         isAnswered: value?.isAnswered,
         usage: value !== undefined && 'usage' in value ? value.usage : undefined,
         deny: result.deny,
@@ -605,10 +669,10 @@ export const register: Register = (on, options) => {
   on('mcp.call', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record(
+    void record(
       $,
       'op.mcp.call',
-      { server: e.server, tool: e.tool, args: await payload(e.args, config.capture), deny: result.deny },
+      { server: e.server, tool: e.tool, args: await payload(e.args, config.capture, await keyOf($)), deny: result.deny },
       next.origin.plugin,
     )
     return result
@@ -617,30 +681,30 @@ export const register: Register = (on, options) => {
   on('tool.register', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record($, 'op.tool.register', { name: e.name, isDeferred: e.isDeferred, deny: result.deny }, next.origin.plugin)
+    void record($, 'op.tool.register', { name: e.name, isDeferred: e.isDeferred, deny: result.deny }, next.origin.plugin)
     return result
   })
 
   on('agent.register', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record($, 'op.agent.register', { spec: await payload(e, 'digest'), deny: result.deny }, next.origin.plugin)
+    void record($, 'op.agent.register', { spec: await payload(e, 'digest', await keyOf($)), deny: result.deny }, next.origin.plugin)
     return result
   })
 
   on('session.authorize', async ($, e, next) => {
     if (next.origin.plugin === $.plugin.name) return next(e)
     const result = await next(e)
-    await record($, 'op.session.authorize', { deny: result.deny }, next.origin.plugin)
+    void record($, 'op.session.authorize', { deny: result.deny }, next.origin.plugin)
     return result
   })
 
   on('session.send', async ($, e, next) => {
     const result = await next(e)
-    await record(
+    void record(
       $,
       'session.send',
-      { to: e.to, agentId: e.agentId, text: await payload(e.text, 'digest') },
+      { to: e.to, agentId: e.agentId, text: await payload(e.text, 'digest', await keyOf($)) },
       next.origin.plugin === 'engine' ? undefined : next.origin.plugin,
     )
     return result
@@ -658,11 +722,11 @@ export const register: Register = (on, options) => {
     const shown = (value: unknown): unknown => (isOwn ? value : undefined)
     if (config.mode === 'enforce' && isOwn && isForeign) {
       const deny = 'audit-ledger: in enforce mode only the person may change audit-ledger settings.'
-      await record($, 'op.config.set', { key: e.key, value: shown(e.value), previous: shown(e.previous), deny }, by)
+      void record($, 'op.config.set', { key: e.key, value: shown(e.value), previous: shown(e.previous), deny }, by)
       return { deny }
     }
     const result = await next(e)
-    await record($, 'op.config.set', { key: e.key, value: shown(e.value), previous: shown(e.previous), deny: result.deny }, by)
+    void record($, 'op.config.set', { key: e.key, value: shown(e.value), previous: shown(e.previous), deny: result.deny }, by)
     return result
   }).catch(($, e, next) => {
     if (next.called) return next(e)

@@ -59,9 +59,35 @@ export const canonical = (value: unknown): string => {
   return `{${members.join(',')}}`
 }
 
-export const sha256Hex = async (text: string): Promise<string> => {
-  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(text))
-  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+export const sha256Hex = async (text: string): Promise<string> => hex(await crypto.subtle.digest('SHA-256', encoder.encode(text)))
+
+const hex = (buffer: ArrayBuffer): string =>
+  Array.from(new Uint8Array(buffer), byte => byte.toString(16).padStart(2, '0')).join('')
+
+const sha256Bytes = async (bytes: Uint8Array): Promise<Uint8Array> =>
+  new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+
+// HMAC-SHA256 (RFC 2104) over the two digests crypto.subtle offers here. A
+// keyed digest lets the ledger prove that two payloads match without letting
+// a reader of the ledger confirm a guessed secret offline.
+export const hmacSha256Hex = async (key: Uint8Array, text: string): Promise<string> => {
+  const block = new Uint8Array(64)
+  block.set(key.length > 64 ? await sha256Bytes(key) : key)
+  const inner = new Uint8Array(64)
+  const outer = new Uint8Array(64)
+  for (let index = 0; index < 64; index += 1) {
+    inner[index] = (block[index] ?? 0) ^ 0x36
+    outer[index] = (block[index] ?? 0) ^ 0x5c
+  }
+  const message = encoder.encode(text)
+  const innerInput = new Uint8Array(64 + message.length)
+  innerInput.set(inner)
+  innerInput.set(message, 64)
+  const innerHash = await sha256Bytes(innerInput)
+  const outerInput = new Uint8Array(64 + innerHash.length)
+  outerInput.set(outer)
+  outerInput.set(innerHash, 64)
+  return hex((await sha256Bytes(outerInput)).buffer as ArrayBuffer)
 }
 
 export const seal = async (body: EntryBody): Promise<Entry> => ({
@@ -69,65 +95,90 @@ export const seal = async (body: EntryBody): Promise<Entry> => ({
   hash: await sha256Hex(canonical(body)),
 })
 
-const SECRET_NAME =
-  '[A-Za-z0-9_.-]*?(?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credentials?|authorization)'
+// Redaction runs over a bounded window: only the excerpt is kept, and every
+// pattern below is linear in its input.
+export const REDACT_WINDOW = EXCERPT_CHARS * 4
 
-const QUOTED_OR_BARE = `(?:"[^"]*"|'[^']*'|[^\\s"',;&|]+)`
+const SECRET_WORDS = new Set([
+  'password', 'passwd', 'pass', 'passphrase', 'secret', 'token', 'credential', 'credentials', 'authorization', 'cookie',
+])
+const SECRET_JOINED = ['apikey', 'accesskey', 'privatekey', 'secretkey', 'clientsecret', 'authtoken', 'sessionkey']
+
+// A name names a secret when one of its words (split on _ . - and camelCase)
+// is a secret word, or its joined words contain a secret compound.
+export const isSecretName = (name: string): boolean => {
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(word => word !== '')
+  if (words.some(word => SECRET_WORDS.has(word))) return true
+  const joined = words.join('')
+  return SECRET_JOINED.some(compound => joined.includes(compound))
+}
+
+const VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|\\"(?:[^"\\\n]|\\(?!"))*\\"|[^\s"'\\,;&|}]+)`
+
+// NAME=value, NAME: value, "name":"value" and \"name\":\"value\", the name
+// starting a token and at most 80 characters, so each run is scanned once.
+const ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_.-])([A-Za-z][A-Za-z0-9_.-]{0,79})(\\?["']?\s*[:=]\s*(?:(?:Bearer|Basic|Token)\s+)?)(${VALUE})`, 'g')
 
 // Each pattern keeps its first group and masks the rest of the match.
 const SECRET_PATTERNS: readonly RegExp[] = [
-  /(-----BEGIN [A-Z ]*PRIVATE KEY-----)[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-  /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(?=@)/gi,
-  /((?:^|\s)(?:-u|--user)\s+[^\s:]+:)\S+/g,
-  new RegExp(`((?<![A-Za-z0-9])["']?${SECRET_NAME}["']?\\s*[:=]\\s*(?:(?:Bearer|Basic|Token)\\s+)?)${QUOTED_OR_BARE}`, 'gi'),
-  new RegExp(`((?:^|\\s)--?[A-Za-z0-9-]*?(?:password|passwd|pwd|secret|token|api-?key)\\s+)${QUOTED_OR_BARE}`, 'gi'),
+  /(-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----)[\s\S]{0,8000}?-----END [A-Z ]{0,40}PRIVATE KEY-----/g,
+  /(\b[a-z][a-z0-9+.-]{0,20}:\/\/[^\s:/@]{1,200}:)[^\s@/]{1,200}(?=@)/gi,
+  new RegExp(String.raw`((?:^|\s)--?(?:password|passwd|pass|secret|token|api-?key)(?:\s+|=))${VALUE}`, 'gi'),
+  /(\b(?:curl|wget)\b[^\n|;&]{0,400}?\s(?:-u\s*|--user[=\s]+)[^\s:]{1,100}:)\S+/g,
+  /(\bmysql(?:dump|admin)?\b[^\n|;&]{0,400}?\s-p)\S+/g,
+  /(\bredis-cli\b[^\n|;&]{0,400}?\s-a\s+)\S+/g,
   /(\bBearer\s+)[A-Za-z0-9._~+/=-]{8,}/g,
   /()\bsk-[A-Za-z0-9_-]{16,}/g,
+  /()\b[sr]k_(?:live|test)_[A-Za-z0-9]{8,}/g,
   /()\bgh[pousr]_[A-Za-z0-9]{20,}/g,
   /()\bAKIA[0-9A-Z]{16}\b/g,
   /()\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
 ]
 
-export const redact = (text: string): string =>
-  SECRET_PATTERNS.reduce(
-    (out, pattern) => out.replace(pattern, (match, kept: unknown) => `${typeof kept === 'string' ? kept : ''}[REDACTED]`),
-    text,
+export const redact = (text: string): string => {
+  const assigned = text.replace(ASSIGNMENT, (match, name: string, separator: string) =>
+    isSecretName(name) ? `${name}${separator}[REDACTED]` : match,
   )
+  return SECRET_PATTERNS.reduce(
+    (out, pattern) => out.replace(pattern, (match, kept: unknown) => `${typeof kept === 'string' ? kept : ''}[REDACTED]`),
+    assigned,
+  )
+}
 
-const SECRET_KEY = /pass(?:word|wd)?|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|authorization|cookie/i
-
-// Masks every string leaf, and the whole value of any key that names a secret.
+// Masks string leaves (within the window), and the whole value of any key
+// that names a secret.
 export const redactValue = (value: unknown): unknown => {
-  if (typeof value === 'string') return redact(value)
+  if (typeof value === 'string') return redact(value.length > REDACT_WINDOW ? value.slice(0, REDACT_WINDOW) : value)
   if (Array.isArray(value)) return value.map(redactValue)
   if (value === null || typeof value !== 'object') return value
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      SECRET_KEY.test(key) && item !== null && item !== undefined && item !== '' ? '[REDACTED]' : redactValue(item),
+      isSecretName(key) && typeof item === 'string' && item !== '' ? '[REDACTED]' : redactValue(item),
     ]),
   )
 }
 
-// digest covers the original text, except where redaction changed it: a
-// digest of the original beside the rest of its text would let a reader
-// confirm a guessed secret offline, so there it covers the redacted text.
+// The digest is a keyed HMAC of the original text, so equal payloads match
+// within one machine's ledgers while no reader can test a guess against it.
 export const payload = async (
   value: unknown,
   capture: Capture,
+  key: Uint8Array,
   limit = EXCERPT_CHARS,
 ): Promise<Payload> => {
   const text = typeof value === 'string' ? value : canonical(value)
-  if (capture === 'digest') return { digest: await sha256Hex(text), bytes: byteLength(text) }
+  const base = { digest: await hmacSha256Hex(key, text), bytes: byteLength(text) }
+  if (capture === 'digest') return base
   const cleanValue = redactValue(value)
   const clean = typeof cleanValue === 'string' ? cleanValue : canonical(cleanValue)
-  const isRedacted = clean !== text
-  return {
-    digest: await sha256Hex(clean),
-    bytes: byteLength(text),
-    excerpt: clean.length > limit ? `${clean.slice(0, limit)}…` : clean,
-    ...(isRedacted ? { isRedacted } : {}),
-  }
+  const excerpt = clean.length > limit ? `${clean.slice(0, limit)}…` : clean
+  const isRedacted = clean.includes('[REDACTED]')
+  return { ...base, excerpt, ...(isRedacted ? { isRedacted } : {}) }
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -160,6 +211,11 @@ export const tailOf = (text: string): SegmentTail => {
   return { last: null, isDamaged }
 }
 
+// Reopen findings that mean the chain lost entries or was altered: once
+// sealed into the chain they fail every later verify. A missing or lagging
+// store head is not tamper evidence.
+export const TAMPER_REASONS: readonly string[] = ['truncated', 'head-mismatch', 'segments-missing', 'damaged-tail']
+
 // Walks every line of every segment in order and proves the chain: seq
 // contiguous from 1, each prev naming the hash before it, each hash
 // recomputed from its body, and the last entry matching the anchored head.
@@ -168,6 +224,7 @@ export const verifyChain = async (
   head: Head | null,
 ): Promise<ChainReport> => {
   const problems: string[] = []
+  const evidence: string[] = []
   let expectedSeq = 1
   let prev = GENESIS
   let entries = 0
@@ -190,17 +247,23 @@ export const verifyChain = async (
     const recomputed = await sha256Hex(canonical(body))
     if (recomputed !== hash) problems.push(`seq ${body.seq}: hash mismatch (content altered)`)
     if (problems.length > 0) break
+    const reasons = body.kind === 'ledger.reanchor' && isRecord(body.data) ? body.data.reasons : null
+    if (Array.isArray(reasons)) {
+      const found = reasons.filter((reason): reason is string => typeof reason === 'string' && TAMPER_REASONS.includes(reason))
+      if (found.length > 0) evidence.push(`seq ${body.seq}: tamper evidence sealed on reopen (${found.join(', ')})`)
+    }
     prev = hash
     expectedSeq = body.seq + 1
     entries += 1
   }
+  problems.push(...evidence)
   const lastSeq = expectedSeq - 1
-  if (problems.length === 0 && head !== null) {
+  if (problems.length === evidence.length && head !== null) {
     if (head.seq > lastSeq) problems.push(`head anchors seq ${head.seq} but the ledger ends at seq ${lastSeq} (truncated)`)
     else if (head.seq < lastSeq) problems.push(`ledger runs to seq ${lastSeq} past the anchored head seq ${head.seq} (unanchored tail)`)
     else if (head.hash !== prev) problems.push(`head hash does not match seq ${lastSeq}`)
   }
-  if (problems.length === 0 && head === null && entries > 0) {
+  if (problems.length === evidence.length && head === null && entries > 0) {
     problems.push('no anchored head for this session')
   }
   return { isIntact: problems.length === 0, entries, lastSeq, lastHash: prev, problems }
@@ -212,10 +275,17 @@ const CLAIM =
 
 export const claimsCompletion = (answer: string): boolean => CLAIM.test(answer)
 
-const CHECK =
-  /\b(pytest|unittest|jest|vitest|mocha|go test|cargo (?:test|check|clippy)|(?:npm|pnpm|yarn|bun)(?: run)? (?:test|lint|check|typecheck)|make (?:test|check|lint)|ruff|eslint|tsc|mypy|pyright|claude plugin (?:validate|test)|ctest|gradle(?:w)? test|mvn test|rspec|phpunit|dotnet test)\b/
+// A check is a command whose executable position runs a test, lint, type or
+// validation tool; a runner named anywhere else (an echo, a grep, a comment)
+// is not a check.
+const RUNNER =
+  /^(?:(?:npx|bunx|pnpm\s+exec|yarn\s+exec|uv\s+run|poetry\s+run)\s+)?(?:pytest|py\.test|python3?\s+-m\s+(?:pytest|unittest|mypy)|unittest|jest|vitest|mocha|tsc|mypy|pyright|ruff|eslint|rspec|phpunit|ctest|go\s+(?:test|vet)|cargo\s+(?:test|check|clippy)|(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+(?:test|lint|check|typecheck)|make\s+(?:test|check|lint)|gradlew?\s+test|\.\/gradlew\s+test|mvn\s+test|dotnet\s+test|claude\s+plugin\s+(?:validate|test))(?:\s|$)/
 
-export const looksLikeCheck = (command: string): boolean => CHECK.test(command)
+export const looksLikeCheck = (command: string): boolean =>
+  command
+    .split(/&&|\|\||[;\n|]/)
+    .map(part => part.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ''))
+    .some(part => RUNNER.test(part))
 
 export type CallNote = { tool: string; outcome: string; isCheck: boolean; summary: string }
 

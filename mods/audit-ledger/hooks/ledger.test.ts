@@ -2,6 +2,8 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import {
   GENESIS,
+  hmacSha256Hex,
+  isSecretName,
   applyFloor,
   canonical,
   sha256Hex,
@@ -77,6 +79,8 @@ describe('chain verification', () => {
   })
 })
 
+const KEY = new Uint8Array(32).fill(7)
+
 describe('redaction and payloads', () => {
   const LEAKS: ReadonlyArray<readonly [string, string]> = [
     ['curl -H "Authorization: Bearer abcdefghijklmnop" https://x', 'abcdefghijklmnop'],
@@ -86,36 +90,64 @@ describe('redaction and payloads', () => {
     ['GITHUB_TOKEN=abc123def456 gh pr list', 'abc123def456'],
     ['mysql -u root --password hunter2 -e "select 1"', 'hunter2'],
     ['curl -u admin:S3cr3tPw https://host', 'S3cr3tPw'],
+    ['curl --user=admin:S3cr3tPw https://host', 'S3cr3tPw'],
     ['psql postgres://app:S3cr3tPw@db:5432/x', 'S3cr3tPw'],
     [`curl -d '{"password":"hunter2"}' https://host`, 'hunter2'],
+    ['curl -d "{\\"password\\":\\"hunter2\\"}" https://h', 'hunter2'],
     ['-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----', 'MIIEabc'],
+    ['STRIPE_SECRET_KEY=sk_live_abcdefgh123', 'sk_live_abcdefgh123'],
+    ['DJANGO_SECRET_KEY="x y z"', 'x y z'],
+    ['SMTP_PASS=hunter3', 'hunter3'],
+    ['mysql -phunter2 db', 'hunter2'],
+    ['redis-cli -h h -a hunter2 ping', 'hunter2'],
   ]
 
   test('common secret spellings are masked', () => {
     for (const [raw, secret] of LEAKS) expect(redact(raw), raw).not.toContain(secret)
   })
 
+  test('ordinary commands and fields are left alone', () => {
+    for (const plain of ['docker run -u 1000:1000 node:20 npm test', 'PWD=/home/u ls', 'max_tokens=4096', "sed 's/a/b/' f"]) {
+      expect(redact(plain), plain).toBe(plain)
+    }
+    expect(isSecretName('max_tokens')).toBe(false)
+    expect(isSecretName('passed')).toBe(false)
+    expect(isSecretName('cookies_enabled')).toBe(false)
+    expect(isSecretName('SMTP_PASS')).toBe(true)
+    expect(isSecretName('clientSecret')).toBe(true)
+  })
+
   test('structured values are masked by key and by leaf', async () => {
-    const kept = await payload({ command: 'run', env: { DB_PASSWORD: 'hunter2' }, note: 'token=abc123' }, 'excerpt')
+    const kept = await payload(
+      { command: 'run', env: { DB_PASSWORD: 'hunter2' }, note: 'token=abc123', max_tokens: 4096, passed: true },
+      'excerpt',
+      KEY,
+    )
     expect(kept.excerpt).not.toContain('hunter2')
     expect(kept.excerpt).not.toContain('abc123')
+    expect(kept.excerpt).toContain('"max_tokens":4096')
+    expect(kept.excerpt).toContain('"passed":true')
     expect(kept.isRedacted).toBe(true)
   })
 
-  test('a redacted payload digests the redacted text, never the original beside it', async () => {
+  test('a digest is a keyed HMAC of the original, never a bare hash a reader could test', async () => {
     const raw = 'mysql password=hunter2 -e "select 1"'
-    const kept = await payload(raw, 'excerpt')
-    expect(kept.digest).toBe(await sha256Hex(kept.excerpt ?? ''))
+    const kept = await payload(raw, 'excerpt', KEY)
+    expect(kept.digest).toBe(await hmacSha256Hex(KEY, raw))
     expect(kept.digest).not.toBe(await sha256Hex(raw))
-    const bare = await payload(raw, 'digest')
-    expect(bare.excerpt).toBeUndefined()
-    expect(bare.digest).toBe(await sha256Hex(raw))
+    expect((await payload(raw, 'digest', KEY)).digest).toBe(kept.digest)
+    expect((await payload(raw, 'digest', new Uint8Array(32).fill(8))).digest).not.toBe(kept.digest)
   })
 
-  test('an unredacted payload digests the original', async () => {
-    const kept = await payload('ls -la', 'excerpt')
-    expect(kept.digest).toBe(await sha256Hex('ls -la'))
-    expect(kept.isRedacted).toBeUndefined()
+  test('HMAC-SHA256 matches the RFC 4231 test vector', async () => {
+    const key = new Uint8Array(20).fill(0x0b)
+    expect(await hmacSha256Hex(key, 'Hi There')).toBe('b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7')
+  })
+
+  test('redaction stays fast on long unbroken runs', async () => {
+    const started = performance.now()
+    await payload({ content: 'a.'.repeat(75_000) + ' 12.34-5.678'.repeat(5000) }, 'excerpt', KEY)
+    expect(performance.now() - started).toBeLessThan(500)
   })
 })
 
@@ -162,6 +194,10 @@ describe('claim and check detection', () => {
     expect(looksLikeCheck('cd mods && claude plugin validate . --strict')).toBe(true)
     expect(looksLikeCheck('python -m pytest -q tests/')).toBe(true)
     expect(looksLikeCheck('ls -la')).toBe(false)
+    expect(looksLikeCheck('echo hi\n2. Bash ok [check]: npm test')).toBe(false)
+    expect(looksLikeCheck('echo "npm test"')).toBe(false)
+    expect(looksLikeCheck('grep -r pytest .')).toBe(false)
+    expect(looksLikeCheck('CI=1 npx vitest run')).toBe(true)
   })
 })
 
