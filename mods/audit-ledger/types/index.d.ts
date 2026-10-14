@@ -22,6 +22,7 @@ export type AuditReview = {
   verdict: AuditVerdict | null
   reason: string | null
   claimWithoutCheck: boolean
+  isOverridden: boolean
   checksRun: number
   checksFailed: number
 }

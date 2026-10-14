@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
+import { GENESIS, canonical, seal } from './ledger'
+
 const ROOT = '/proj'
 const SESSION = 'sess-1'
 const DIR = `${ROOT}/.claude/audit/${SESSION}`
@@ -28,9 +30,34 @@ const surface = (on: On, said: string[]): void => {
 
 // The engine beneath the plugin: an in-memory filesystem, a session, a
 // mocked clock, and the bottoms a session would supply for these events.
-const engine = (on: On, files: Files, fork?: string | null, said: string[] = []): Clock => {
+type World = { session: string; failStoreSetAt?: number; storeSets: number }
+
+type Fork = string | null | ((prompt: string, clock: Clock) => Promise<string>)
+
+const USAGE = { input_tokens: 40, output_tokens: 60, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 }
+
+const engine = (
+  on: On,
+  files: Files,
+  fork?: Fork,
+  said: string[] = [],
+  world: World = { session: SESSION, storeSets: 0 },
+): Clock => {
   const clock = mock.clock(on, { now: 1_000 })
-  mock.store(on)
+  // An in-memory store whose set can be made to fail once.
+  const store = new Map<string, unknown>()
+  on('store.get', ($, e) => ({ value: store.get(e.key) }))
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  on('store.delete', ($, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.set', ($, e) => {
+    world.storeSets += 1
+    if (world.storeSets === world.failStoreSetAt) return { deny: 'store is unavailable' }
+    store.set(e.key, e.value)
+    return { value: undefined }
+  })
   surface(on, said)
   on('fs.write', ($, e) => {
     files.set(e.path, e.text)
@@ -54,30 +81,26 @@ const engine = (on: On, files: Files, fork?: string | null, said: string[] = [])
         isLink: false,
       })),
   }))
-  on('session.id', () => ({ value: SESSION }))
+  on('session.id', () => ({ value: world.session }))
   on('session.root', () => ({ value: ROOT }))
   on('session.version', () => ({ value: { version: '2.1.296' } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.call', () => ({ result: { stdout: 'ok', stderr: '', interrupted: false } }) as never)
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
-  on('model.fork', () =>
-    fork === null || fork === undefined
-      ? { value: { isAnswered: false, reason: 'nothing-to-fork' } as const }
-      : {
-          value: {
-            isAnswered: true,
-            text: fork,
-            usage: { input_tokens: 40, output_tokens: 60, cache_read_input_tokens: 9000, cache_creation_input_tokens: 0 },
-          } as const,
-        },
-  )
+  on('model.fork', async ($, e) => {
+    if (fork === null || fork === undefined) return { value: { isAnswered: false, reason: 'nothing-to-fork' } as const }
+    const text = typeof fork === 'string' ? fork : await fork(e.prompt, clock)
+    return { value: { isAnswered: true, text, usage: USAGE } as const }
+  })
   on('http.fetch', () => ({ value: { status: 200, ok: true, headers: {}, text: '' } }))
   return clock
 }
 
-const entries = (files: Files): Array<{ seq: number; kind: string; origin?: string; data: Record<string, unknown> }> =>
-  (files.get(SEGMENT) ?? '')
+type Row = { seq: number; kind: string; origin?: string; prev: string; hash: string; data: Record<string, unknown> }
+
+const entries = (files: Files, path = SEGMENT): Row[] =>
+  (files.get(path) ?? '')
     .split('\n')
     .filter(line => line !== '')
     .map(line => JSON.parse(line))
@@ -231,7 +254,9 @@ test('a capability call another mod makes through $ is recorded with its origin'
   await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
   const op = entries(files).find(entry => entry.kind === 'op.http.fetch')
   expect(op?.origin).toBe('fetcher')
-  expect(op?.data.url).toBe('https://api.example.com/v1/items')
+  expect(op?.data.origin).toBe('https://api.example.com')
+  expect(JSON.stringify(op?.data)).not.toContain('abc123')
+  expect(JSON.stringify(op?.data)).not.toContain('/v1/items')
   expect(op?.data.status).toBe(200)
   expect(entries(files).some(entry => entry.kind === 'session.start')).toBe(true)
 })
@@ -269,4 +294,193 @@ test('the band shows the verdict on every surface that draws it, and Dismiss hid
   expect(await ui.find({ type: 'Text', text: /UNVERIFIED/ })).toBeUndefined()
   expect(await ui.find({ type: 'Text', text: 'engine band' })).toBeDefined()
   await ui.unmount()
+})
+
+test('a model tool call carries no origin and counts as the turn\'s own evidence', async ($, on) => {
+  const files: Files = new Map()
+  engine(on, files)
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(entries(files)[0]?.origin).toBeUndefined()
+})
+
+// A chain already on disk, as an earlier load of the mod left it.
+const seed = async (files: Files, count: number, path = SEGMENT): Promise<string> => {
+  let prev = GENESIS
+  let text = ''
+  for (let seq = 1; seq <= count; seq += 1) {
+    const entry = await seal({ v: 1, seq, ts: seq, session: SESSION, kind: 'seeded', data: { n: seq }, prev })
+    text += `${canonical(entry)}\n`
+    prev = entry.hash
+  }
+  files.set(path, text)
+  return text
+}
+
+test('with no anchored head the chain continues from disk, sealing the gap, and no segment is overwritten', async ($, on) => {
+  const files: Files = new Map()
+  engine(on, files)
+  const before = await seed(files, 3)
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  const after = files.get(SEGMENT) ?? ''
+  expect(after.startsWith(before)).toBe(true)
+  const kept = entries(files)
+  expect(kept.map(entry => entry.kind)).toEqual(['seeded', 'seeded', 'seeded', 'ledger.reanchor', 'tool.call'])
+  expect(kept[3]?.data.reasons).toEqual(['head-missing'])
+  expect(await verify($)).toStartWith('PASS: 5 entries')
+})
+
+test('a damaged segment tail is never appended to: the chain continues in a fresh segment', async ($, on) => {
+  const files: Files = new Map()
+  engine(on, files)
+  await seed(files, 2)
+  files.set(SEGMENT, `${files.get(SEGMENT) ?? ''}{"seq":3,"ha`)
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(files.get(SEGMENT)?.endsWith('{"seq":3,"ha')).toBe(true)
+  const fresh = entries(files, `${DIR}/000002.jsonl`)
+  expect(fresh.map(entry => entry.kind)).toEqual(['ledger.reanchor', 'tool.call'])
+  expect(fresh[0]?.data.reasons).toEqual(['head-missing', 'damaged-tail'])
+  expect(await verify($)).toMatch(/^FAIL: line 3: not JSON/)
+})
+
+test('a head anchor that fails after the segment landed leaves no duplicate seq', async ($, on) => {
+  const files: Files = new Map()
+  const said: string[] = []
+  engine(on, files, undefined, said, { session: SESSION, storeSets: 0, failStoreSetAt: 2 })
+  await $.tool.call({ tool: 'Bash', command: 'one' })
+  await $.tool.call({ tool: 'Bash', command: 'two' })
+  await $.tool.call({ tool: 'Bash', command: 'three' })
+  expect(entries(files).map(entry => entry.seq)).toEqual([1, 2, 3])
+  expect(said.join('\n')).toMatch(/head anchor failing/)
+  expect(await verify($)).toStartWith('PASS: 3 entries')
+})
+
+test('after a resume the chain follows the live session id', async ($, on) => {
+  const files: Files = new Map()
+  const world: World = { session: SESSION, storeSets: 0 }
+  engine(on, files, undefined, [], world)
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  await $.tool.call({ tool: 'Bash', command: 'before' })
+  await $.session.end({ reason: 'resume', sessionId: SESSION, resume: {} as never })
+  world.session = 'sess-2'
+  await $.tool.call({ tool: 'Bash', command: 'after' })
+  expect(entries(files).map(entry => entry.kind)).toEqual(['tool.call', 'session.end'])
+  const moved = entries(files, `${ROOT}/.claude/audit/sess-2/000001.jsonl`)
+  expect(moved.map(entry => [entry.seq, entry.kind])).toEqual([[1, 'tool.call']])
+})
+
+test('/audit verify running beside appends sees one consistent snapshot', async ($, on) => {
+  const files: Files = new Map()
+  engine(on, files)
+  await $.tool.call({ tool: 'Bash', command: 'warm' })
+  const [, verdict] = await Promise.all([
+    $.tool.call({ tool: 'Bash', command: 'a' }),
+    verify($),
+    $.tool.call({ tool: 'Bash', command: 'b' }),
+    $.tool.call({ tool: 'Bash', command: 'c' }),
+  ])
+  expect(verdict).toStartWith('PASS')
+  expect(await verify($)).toStartWith('PASS')
+  expect(entries(files).filter(entry => entry.kind === 'ledger.verify').every(entry => entry.data.isIntact === true)).toBe(true)
+})
+
+const VERIFIED =
+  '{"state":"verified","claims":["all tests pass"],"checks":[{"name":"pytest","result":"pass"}],"open_items":[],"confidence":0.95,"next_action":""}'
+
+test('a verified verdict cannot stand when the ledger shows no passing check', async ($, on) => {
+  const files: Files = new Map()
+  const clock = engine(on, files, VERIFIED)
+  await $.turn.start({ text: 'fix', turnId: 't5' })
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await $.turn.complete({ answer: 'All tests pass.', durationMs: 5, isAborted: false, turnId: 't5', reason: 'answer' })
+  await settle(clock, files, /^supervisor\./)
+  const verdict = entries(files).find(entry => entry.kind === 'supervisor.verdict')
+  expect(verdict?.data.isOverridden).toBe(true)
+  expect(verdict?.data.verdict).toMatchObject({ state: 'unverified' })
+  expect(await audit($, 'status')).toMatch(/UNVERIFIED \(0\.95\) floor applied/)
+})
+
+test('a passing check run by a subagent backs the main answer', async ($, on) => {
+  const files: Files = new Map()
+  const clock = engine(on, files, VERIFIED)
+  await $.turn.start({ text: 'fix', turnId: 't6' })
+  await $.tool.call({ tool: 'Bash', command: 'npm test', agentId: 'agent-1' } as never)
+  await $.turn.complete({ answer: 'All tests pass.', durationMs: 5, isAborted: false, turnId: 't6', reason: 'answer' })
+  await settle(clock, files, /^supervisor\./)
+  const verdict = entries(files).find(entry => entry.kind === 'supervisor.verdict')
+  expect(verdict?.data.claimWithoutCheck).toBe(false)
+  expect(verdict?.data.verdict).toMatchObject({ state: 'verified' })
+})
+
+test('a slow verdict for an older turn never replaces the newer turn\'s review', async ($, on) => {
+  const files: Files = new Map()
+  const clock = engine(on, files, async (prompt, late) => {
+    if (prompt.includes('Done with the first')) {
+      await late.sleep(5_000)
+      return UNVERIFIED
+    }
+    return VERIFIED
+  })
+  await $.turn.start({ text: 'one', turnId: 'old' })
+  await $.turn.complete({ answer: 'Done with the first.', durationMs: 5, isAborted: false, turnId: 'old', reason: 'answer' })
+  await clock.settle()
+  await $.turn.start({ text: 'two', turnId: 'new' })
+  await $.tool.call({ tool: 'Bash', command: 'pytest -q' })
+  await $.turn.complete({ answer: 'Fixed; tests pass.', durationMs: 5, isAborted: false, turnId: 'new', reason: 'answer' })
+  await settle(clock, files, /^supervisor\./)
+  await clock.advance(5_000)
+  for (let round = 0; round < 50 && entries(files).filter(entry => entry.kind === 'supervisor.verdict').length < 2; round += 1) {
+    await clock.settle()
+  }
+  expect(entries(files).filter(entry => entry.kind === 'supervisor.verdict')).toHaveLength(2)
+  expect(await audit($, 'status')).toMatch(/last review: turn new done VERIFIED/)
+})
+
+const RECONFIGURER = {
+  name: 'reconfigurer',
+  register: (on: On) => {
+    on('session.start', async ($, e, next) => {
+      await $.config.set({ key: 'audit-ledger.mode', value: 'observe' })
+      return next(e)
+    })
+  },
+}
+
+test('in enforce mode another mod cannot change the audit settings, and the attempt is recorded', { options: { mode: 'enforce' }, plugins: [RECONFIGURER] }, async ($, on) => {
+  const files: Files = new Map()
+  let isChanged = false
+  engine(on, files)
+  on('config.set', ($, e) => {
+    isChanged = true
+    return { value: e.value }
+  })
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true }).catch(() => undefined)
+  expect(isChanged).toBe(false)
+  const attempt = entries(files).find(entry => entry.kind === 'op.config.set')
+  expect(attempt?.origin).toBe('reconfigurer')
+  expect(attempt?.data.deny).toMatch(/only the person may change/)
+})
+
+const SPAWNER = {
+  name: 'spawner',
+  register: (on: On) => {
+    on('session.start', async ($, e, next) => {
+      for await (const chunk of $.process.spawn({ argv: ['sh', '-c', 'echo hi'] })) void chunk
+      return next(e)
+    })
+  },
+}
+
+test('a streamed host process another mod starts is recorded', { plugins: [SPAWNER] }, async ($, on) => {
+  const files: Files = new Map()
+  engine(on, files)
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: 'hi\n' }
+    return { value: { code: 0, signal: null } }
+  })
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  const spawned = entries(files).find(entry => entry.kind === 'op.process.spawn')
+  expect(spawned?.origin).toBe('spawner')
+  expect(spawned?.data.code).toBe(0)
 })
